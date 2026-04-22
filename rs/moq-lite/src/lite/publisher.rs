@@ -294,9 +294,35 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 
 		stream.writer.encode(&lite::SubscribeResponse::Ok(info)).await?;
 
-		tokio::select! {
-			res = Self::run_track(session, track, subscribe, priority, version, shed) => res?,
-			res = stream.reader.closed() => res?,
+		let (drop_tx, mut drop_rx) = tokio::sync::mpsc::channel::<(u64, u64)>(16);
+		let mut track_fut = std::pin::pin!(
+			Self::run_track(session, track, subscribe, priority, version, shed, drop_tx)
+		);
+
+		loop {
+			tokio::select! {
+				res = &mut track_fut => { res?; break; },
+				res = stream.reader.closed() => { res?; break; },
+				Some((start, end)) = drop_rx.recv() => {
+					let msg = lite::SubscribeResponse::Drop(lite::SubscribeDrop {
+						start, end, error: 0,
+					});
+					match stream.writer.encode(&msg).await {
+						Ok(()) => {
+							tracing::debug!(
+								id = %subscribe.id,
+								start,
+								end,
+								"sent SubscribeDrop"
+							);
+						}
+						Err(Error::Encode(crate::coding::EncodeError::Version)) => {
+							// Lite01/02: no SubscribeDrop support, silently skip.
+						}
+						Err(e) => return Err(e),
+					}
+				},
+			}
 		}
 
 		stream.writer.finish()?;
@@ -310,8 +336,10 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 		priority: PriorityQueue,
 		version: Version,
 		shed: Option<Arc<ShedController>>,
+		drop_tx: tokio::sync::mpsc::Sender<(u64, u64)>,
 	) -> Result<(), Error> {
 		let mut tasks = FuturesUnordered::new();
+		let mut shed_range: Option<(u64, u64)> = None;
 
 		// Start the consumer at the specified sequence, otherwise start at the latest group.
 		if let Some(start_group) = subscribe.start_group.or_else(|| track.latest()) {
@@ -326,22 +354,38 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 					false
 				} => unreachable!(),
 				Some(group) = track.next_group().transpose() => group,
-				else => return Ok(()),
+				else => {
+					// Flush any pending shed range before returning.
+					if let Some((start, end)) = shed_range.take() {
+						let _ = drop_tx.try_send((start, end));
+					}
+					return Ok(());
+				},
 			}?;
 
 			// Relay shedding: poll CC estimate and check if this track should be forwarded.
 			if let Some(ref shed) = shed {
 				shed.update(session.stats().estimated_send_rate());
 				if !shed.should_forward(track.info.priority) {
+					let sequence = group.info.sequence;
 					tracing::trace!(
 						subscribe = %subscribe.id,
 						track = %track.info.name,
 						priority = track.info.priority,
-						sequence = group.info.sequence,
+						sequence,
 						"group shed by relay"
 					);
+					match &mut shed_range {
+						Some((_, end)) => *end = sequence,
+						None => shed_range = Some((sequence, sequence)),
+					}
 					continue;
 				}
+			}
+
+			// Flush any pending shed range — a non-shed group breaks the run.
+			if let Some((start, end)) = shed_range.take() {
+				let _ = drop_tx.try_send((start, end));
 			}
 
 			let sequence = group.info.sequence;
