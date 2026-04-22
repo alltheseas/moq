@@ -317,8 +317,22 @@ impl<S: web_transport_trait::Session> Subscriber<S> {
 			return Err(Error::ProtocolViolation);
 		};
 
-		// TODO handle additional SUBSCRIBE_OK and SUBSCRIBE_DROP messages.
-		stream.reader.closed().await?;
+		while let Some(resp) = stream.reader.decode_maybe::<lite::SubscribeResponse>().await? {
+			match resp {
+				lite::SubscribeResponse::Ok(_info) => {
+					tracing::debug!(id = msg.id, "received additional SubscribeOk");
+				}
+				lite::SubscribeResponse::Drop(drop) => {
+					tracing::debug!(
+						id = msg.id,
+						start = drop.start,
+						end = drop.end,
+						error = drop.error,
+						"received SubscribeDrop"
+					);
+				}
+			}
+		}
 
 		Ok(())
 	}
