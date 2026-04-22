@@ -1,5 +1,7 @@
+use std::sync::Arc;
 use std::time::Duration;
 
+use bytes::Buf;
 use futures::{FutureExt, StreamExt, stream::FuturesUnordered};
 use web_async::FuturesExt;
 use web_transport_trait::Stats;
@@ -15,12 +17,14 @@ use crate::{
 };
 
 use super::Version;
+use super::shed::ShedController;
 
 pub(super) struct Publisher<S: web_transport_trait::Session> {
 	session: S,
 	origin: OriginConsumer,
 	priority: PriorityQueue,
 	version: Version,
+	shed: Option<Arc<ShedController>>,
 }
 
 impl<S: web_transport_trait::Session> Publisher<S> {
@@ -32,7 +36,18 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 			origin,
 			priority: Default::default(),
 			version,
+			shed: None,
 		}
+	}
+
+	/// Enable relay-side bandwidth shedding for this publisher.
+	///
+	/// When enabled, each subscriber connection gets a ShedController that monitors
+	/// the QUIC CC bandwidth estimate and sheds low-priority tracks when bandwidth
+	/// is scarce. This should only be called by the relay code path.
+	pub fn with_shedding(mut self) -> Self {
+		self.shed = Some(Arc::new(ShedController::new(std::time::Duration::ZERO)));
+		self
 	}
 
 	pub async fn run(mut self) -> Result<(), Error> {
@@ -226,10 +241,11 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 		let broadcast = self.origin.consume_broadcast(&subscribe.broadcast);
 		let priority = self.priority.clone();
 		let version = self.version;
+		let shed = self.shed.clone();
 
 		let session = self.session.clone();
 		web_async::spawn(async move {
-			if let Err(err) = Self::run_subscribe(session, &mut stream, &subscribe, broadcast, priority, version).await
+			if let Err(err) = Self::run_subscribe(session, &mut stream, &subscribe, broadcast, priority, version, shed).await
 			{
 				match &err {
 					// TODO better classify WebTransport errors.
@@ -256,6 +272,7 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 		consumer: Option<BroadcastConsumer>,
 		priority: PriorityQueue,
 		version: Version,
+		shed: Option<Arc<ShedController>>,
 	) -> Result<(), Error> {
 		let track = Track {
 			name: subscribe.track.to_string(),
@@ -278,7 +295,7 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 		stream.writer.encode(&lite::SubscribeResponse::Ok(info)).await?;
 
 		tokio::select! {
-			res = Self::run_track(session, track, subscribe, priority, version) => res?,
+			res = Self::run_track(session, track, subscribe, priority, version, shed) => res?,
 			res = stream.reader.closed() => res?,
 		}
 
@@ -292,6 +309,7 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 		subscribe: &lite::Subscribe<'_>,
 		priority: PriorityQueue,
 		version: Version,
+		shed: Option<Arc<ShedController>>,
 	) -> Result<(), Error> {
 		let mut tasks = FuturesUnordered::new();
 
@@ -311,6 +329,21 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 				else => return Ok(()),
 			}?;
 
+			// Relay shedding: poll CC estimate and check if this track should be forwarded.
+			if let Some(ref shed) = shed {
+				shed.update(session.stats().estimated_send_rate());
+				if !shed.should_forward(track.info.priority) {
+					tracing::trace!(
+						subscribe = %subscribe.id,
+						track = %track.info.name,
+						priority = track.info.priority,
+						sequence = group.info.sequence,
+						"group shed by relay"
+					);
+					continue;
+				}
+			}
+
 			let sequence = group.info.sequence;
 			tracing::debug!(subscribe = %subscribe.id, track = %track.info.name, sequence, "serving group");
 
@@ -320,7 +353,7 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 			};
 
 			let priority = priority.insert(track.info.priority, sequence);
-			tasks.push(Self::serve_group(session.clone(), msg, priority, group, version).map(|_| ()));
+			tasks.push(Self::serve_group(session.clone(), msg, priority, group, version, shed.clone()).map(|_| ()));
 		}
 	}
 
@@ -330,6 +363,7 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 		mut priority: PriorityHandle,
 		mut group: GroupConsumer,
 		version: Version,
+		shed: Option<Arc<ShedController>>,
 	) -> Result<(), Error> {
 		// TODO add a way to open in priority order.
 		let stream = session.open_uni().await.map_err(Error::from_transport)?;
@@ -338,6 +372,9 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 		stream.set_priority(priority.current());
 		stream.encode(&lite::DataType::Group).await?;
 		stream.encode(&msg).await?;
+
+		// Extract priority value once for byte reporting.
+		let priority_value = priority.current();
 
 		loop {
 			let frame = tokio::select! {
@@ -371,7 +408,13 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 				};
 
 				match chunk? {
-					Some(mut chunk) => stream.write_all(&mut chunk).await?,
+					Some(mut chunk) => {
+						let len = chunk.remaining();
+						stream.write_all(&mut chunk).await?;
+						if let Some(ref shed) = shed {
+							shed.report_bytes(priority_value, len);
+						}
+					}
 					None => break,
 				}
 			}

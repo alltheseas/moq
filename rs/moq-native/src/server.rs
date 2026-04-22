@@ -577,6 +577,12 @@ impl Request {
 		self
 	}
 
+	/// Enable relay-side bandwidth shedding for subscriber connections.
+	pub fn with_relay_shedding(mut self, enabled: bool) -> Self {
+		self.server = self.server.with_relay_shedding(enabled);
+		self
+	}
+
 	/// Accept the session, performing rest of the MoQ handshake.
 	pub async fn ok(self) -> anyhow::Result<Session> {
 		match self.kind {

@@ -89,13 +89,17 @@ async fn main() -> anyhow::Result<()> {
 	tokio::select! {
 		Err(err) = cluster.clone().run() => return Err(err).context("cluster failed"),
 		Err(err) = web.run() => return Err(err).context("web server failed"),
-		Err(err) = serve(server, cluster, auth) => return Err(err).context("server failed"),
+		Err(err) = serve(server, cluster, auth, config.relay_shedding) => return Err(err).context("server failed"),
 		Err(err) = jemalloc => return Err(err).context("jemalloc profiler failed"),
 		else => Ok(()),
 	}
 }
 
-async fn serve(mut server: moq_native::Server, cluster: Cluster, auth: Auth) -> anyhow::Result<()> {
+async fn serve(mut server: moq_native::Server, cluster: Cluster, auth: Auth, relay_shedding: bool) -> anyhow::Result<()> {
+	if relay_shedding {
+		tracing::info!("relay-side bandwidth shedding enabled");
+	}
+
 	let mut conn_id = 0;
 
 	while let Some(request) = server.accept().await {
@@ -104,6 +108,7 @@ async fn serve(mut server: moq_native::Server, cluster: Cluster, auth: Auth) -> 
 			request,
 			cluster: cluster.clone(),
 			auth: auth.clone(),
+			relay_shedding,
 		};
 
 		conn_id += 1;

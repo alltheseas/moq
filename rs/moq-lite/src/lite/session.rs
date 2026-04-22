@@ -15,6 +15,17 @@ pub fn start<S: web_transport_trait::Session>(
 	// The version of the protocol to use.
 	version: Version,
 ) -> Result<Option<BandwidthConsumer>, Error> {
+	start_with_shedding(session, setup, publish, subscribe, version, false)
+}
+
+pub fn start_with_shedding<S: web_transport_trait::Session>(
+	session: S,
+	setup: Option<Stream<S, Version>>,
+	publish: Option<OriginConsumer>,
+	subscribe: Option<OriginProducer>,
+	version: Version,
+	relay_shedding: bool,
+) -> Result<Option<BandwidthConsumer>, Error> {
 	let recv_bw = BandwidthProducer::new();
 
 	let recv_bw_consumer = match version {
@@ -28,6 +39,7 @@ pub fn start<S: web_transport_trait::Session>(
 	};
 
 	let publisher = Publisher::new(session.clone(), publish, version);
+	let publisher = if relay_shedding { publisher.with_shedding() } else { publisher };
 	let subscriber = Subscriber::new(session.clone(), subscribe, recv_bw_for_sub, version);
 
 	web_async::spawn(async move {

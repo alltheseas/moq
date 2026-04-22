@@ -40,6 +40,15 @@ pub struct Config {
 	#[serde(default)]
 	pub web: WebConfig,
 
+	/// Enable relay-side bandwidth shedding for subscriber connections.
+	///
+	/// When enabled, the relay monitors each subscriber's QUIC bandwidth and
+	/// drops low-priority groups (e.g. video) when bandwidth is scarce, while
+	/// preserving high-priority ones (e.g. safety heartbeat).
+	#[arg(long, default_value_t = false)]
+	#[serde(default)]
+	pub relay_shedding: bool,
+
 	/// If provided, load the configuration from this file.
 	#[serde(default)]
 	pub file: Option<String>,

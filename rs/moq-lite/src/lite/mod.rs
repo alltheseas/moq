@@ -15,6 +15,7 @@ mod priority;
 mod probe;
 mod publisher;
 mod session;
+mod shed;
 mod stream;
 mod subscribe;
 mod subscriber;

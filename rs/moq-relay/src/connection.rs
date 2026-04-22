@@ -51,6 +51,8 @@ pub struct Connection {
 	pub cluster: Cluster,
 	/// The authenticator used to verify credentials.
 	pub auth: Auth,
+	/// Whether relay-side bandwidth shedding is enabled.
+	pub relay_shedding: bool,
 }
 
 impl Connection {
@@ -116,6 +118,7 @@ impl Connection {
 			.request
 			.with_publish(subscribe)
 			.with_consume(publish)
+			.with_relay_shedding(self.relay_shedding)
 			// TODO: Uncomment when observability feature is merged
 			// .with_stats(stats)
 			.ok()

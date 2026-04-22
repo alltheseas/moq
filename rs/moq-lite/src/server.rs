@@ -11,6 +11,7 @@ pub struct Server {
 	publish: Option<OriginConsumer>,
 	consume: Option<OriginProducer>,
 	versions: Versions,
+	relay_shedding: bool,
 }
 
 impl Server {
@@ -38,6 +39,17 @@ impl Server {
 
 	pub fn with_versions(mut self, versions: Versions) -> Self {
 		self.versions = versions;
+		self
+	}
+
+	/// Enable relay-side bandwidth shedding.
+	///
+	/// When enabled, each subscriber's Publisher monitors the QUIC CC bandwidth
+	/// estimate and drops low-priority groups when bandwidth is scarce. This
+	/// preserves high-priority tracks (safety/heartbeat) at the expense of
+	/// expendable ones (video).
+	pub fn with_relay_shedding(mut self, enabled: bool) -> Self {
+		self.relay_shedding = enabled;
 		self
 	}
 
@@ -94,12 +106,13 @@ impl Server {
 					.select(Version::Lite(lite::Version::Lite04))
 					.ok_or(Error::Version)?;
 
-				let recv_bw = lite::start(
+				let recv_bw = lite::start_with_shedding(
 					session.clone(),
 					None,
 					self.publish.clone(),
 					self.consume.clone(),
 					lite::Version::Lite04,
+					self.relay_shedding,
 				)?;
 
 				return Ok(Session::new(session, lite::Version::Lite04.into(), recv_bw));
@@ -110,12 +123,13 @@ impl Server {
 					.ok_or(Error::Version)?;
 
 				// Starting with draft-03, there's no more SETUP control stream.
-				let recv_bw = lite::start(
+				let recv_bw = lite::start_with_shedding(
 					session.clone(),
 					None,
 					self.publish.clone(),
 					self.consume.clone(),
 					lite::Version::Lite03,
+					self.relay_shedding,
 				)?;
 
 				return Ok(Session::new(session, lite::Version::Lite03.into(), recv_bw));
@@ -159,12 +173,13 @@ impl Server {
 		let recv_bw = match version {
 			Version::Lite(v) => {
 				let stream = stream.with_version(v);
-				lite::start(
+				lite::start_with_shedding(
 					session.clone(),
 					Some(stream),
 					self.publish.clone(),
 					self.consume.clone(),
 					v,
+					self.relay_shedding,
 				)?
 			}
 			Version::Ietf(v) => {
