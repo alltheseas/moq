@@ -1,5 +1,8 @@
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use bytes::Buf;
 use futures::{FutureExt, StreamExt, stream::FuturesUnordered};
@@ -19,12 +22,82 @@ use crate::{
 use super::Version;
 use super::shed::ShedController;
 
+/// Per-priority relay latency accumulator.
+/// Tracks queue wait (time between group arrival and serve_group start)
+/// and serve time (open_uni + frame writes + finish).
+struct RelayPriorityLatency {
+	count: AtomicU64,
+	queue_sum_us: AtomicU64,
+	serve_sum_us: AtomicU64,
+	max_us: AtomicU64,
+}
+
+impl RelayPriorityLatency {
+	fn new() -> Self {
+		Self {
+			count: AtomicU64::new(0),
+			queue_sum_us: AtomicU64::new(0),
+			serve_sum_us: AtomicU64::new(0),
+			max_us: AtomicU64::new(0),
+		}
+	}
+}
+
+/// Per-subscriber relay latency stats, shared across run_track tasks.
+pub(super) struct RelayLatencyStats {
+	priorities: Mutex<HashMap<u8, RelayPriorityLatency>>,
+}
+
+impl RelayLatencyStats {
+	pub fn new() -> Self {
+		Self {
+			priorities: Mutex::new(HashMap::new()),
+		}
+	}
+
+	fn record(&self, priority: u8, queue_us: u64, serve_us: u64) {
+		let mut map = self.priorities.lock().unwrap();
+		let entry = map.entry(priority).or_insert_with(RelayPriorityLatency::new);
+		entry.count.fetch_add(1, Ordering::Relaxed);
+		entry.queue_sum_us.fetch_add(queue_us, Ordering::Relaxed);
+		entry.serve_sum_us.fetch_add(serve_us, Ordering::Relaxed);
+		let total = queue_us + serve_us;
+		let mut current = entry.max_us.load(Ordering::Relaxed);
+		while total > current {
+			match entry.max_us.compare_exchange_weak(
+				current, total, Ordering::Relaxed, Ordering::Relaxed,
+			) {
+				Ok(_) => break,
+				Err(v) => current = v,
+			}
+		}
+	}
+
+	/// Drain all accumulators and return (priority, count, queue_avg_us, serve_avg_us, max_us).
+	fn drain(&self) -> Vec<(u8, u64, u64, u64, u64)> {
+		let map = self.priorities.lock().unwrap();
+		let mut out = Vec::new();
+		for (&priority, entry) in map.iter() {
+			let count = entry.count.swap(0, Ordering::Relaxed);
+			let queue_sum = entry.queue_sum_us.swap(0, Ordering::Relaxed);
+			let serve_sum = entry.serve_sum_us.swap(0, Ordering::Relaxed);
+			let max = entry.max_us.swap(0, Ordering::Relaxed);
+			if count > 0 {
+				out.push((priority, count, queue_sum / count, serve_sum / count, max));
+			}
+		}
+		out.sort_by_key(|&(p, _, _, _, _)| std::cmp::Reverse(p));
+		out
+	}
+}
+
 pub(super) struct Publisher<S: web_transport_trait::Session> {
 	session: S,
 	origin: OriginConsumer,
 	priority: PriorityQueue,
 	version: Version,
 	shed: Option<Arc<ShedController>>,
+	relay_latency: Option<Arc<RelayLatencyStats>>,
 }
 
 impl<S: web_transport_trait::Session> Publisher<S> {
@@ -37,6 +110,7 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 			priority: Default::default(),
 			version,
 			shed: None,
+			relay_latency: None,
 		}
 	}
 
@@ -44,9 +118,30 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 	///
 	/// When enabled, each subscriber connection gets a ShedController that monitors
 	/// the QUIC CC bandwidth estimate and sheds low-priority tracks when bandwidth
-	/// is scarce. This should only be called by the relay code path.
+	/// is scarce. Also enables per-subscriber relay latency instrumentation.
+	/// This should only be called by the relay code path.
 	pub fn with_shedding(mut self) -> Self {
 		self.shed = Some(Arc::new(ShedController::new(std::time::Duration::ZERO)));
+		let latency = Arc::new(RelayLatencyStats::new());
+		let latency_clone = latency.clone();
+		web_async::spawn(async move {
+			let mut interval = tokio::time::interval(Duration::from_secs(1));
+			loop {
+				interval.tick().await;
+				let drained = latency_clone.drain();
+				for (priority, count, queue_avg, serve_avg, max) in drained {
+					tracing::info!(
+						priority,
+						relay_queue_avg_us = queue_avg,
+						relay_serve_avg_us = serve_avg,
+						relay_max_us = max,
+						count,
+						"relay_latency"
+					);
+				}
+			}
+		});
+		self.relay_latency = Some(latency);
 		self
 	}
 
@@ -242,10 +337,11 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 		let priority = self.priority.clone();
 		let version = self.version;
 		let shed = self.shed.clone();
+		let relay_latency = self.relay_latency.clone();
 
 		let session = self.session.clone();
 		web_async::spawn(async move {
-			if let Err(err) = Self::run_subscribe(session, &mut stream, &subscribe, broadcast, priority, version, shed).await
+			if let Err(err) = Self::run_subscribe(session, &mut stream, &subscribe, broadcast, priority, version, shed, relay_latency).await
 			{
 				match &err {
 					// TODO better classify WebTransport errors.
@@ -273,6 +369,7 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 		priority: PriorityQueue,
 		version: Version,
 		shed: Option<Arc<ShedController>>,
+		relay_latency: Option<Arc<RelayLatencyStats>>,
 	) -> Result<(), Error> {
 		let track = Track {
 			name: subscribe.track.to_string(),
@@ -296,7 +393,7 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 
 		let (drop_tx, mut drop_rx) = tokio::sync::mpsc::channel::<(u64, u64)>(16);
 		let mut track_fut = std::pin::pin!(
-			Self::run_track(session, track, subscribe, priority, version, shed, drop_tx)
+			Self::run_track(session, track, subscribe, priority, version, shed, relay_latency, drop_tx)
 		);
 
 		loop {
@@ -336,6 +433,7 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 		priority: PriorityQueue,
 		version: Version,
 		shed: Option<Arc<ShedController>>,
+		relay_latency: Option<Arc<RelayLatencyStats>>,
 		drop_tx: tokio::sync::mpsc::Sender<(u64, u64)>,
 	) -> Result<(), Error> {
 		let mut tasks = FuturesUnordered::new();
@@ -388,6 +486,7 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 				let _ = drop_tx.try_send((start, end));
 			}
 
+			let group_arrival = Instant::now();
 			let sequence = group.info.sequence;
 			tracing::debug!(subscribe = %subscribe.id, track = %track.info.name, sequence, "serving group");
 
@@ -397,7 +496,7 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 			};
 
 			let priority = priority.insert(track.info.priority, sequence);
-			tasks.push(Self::serve_group(session.clone(), msg, priority, group, version, shed.clone()).map(|_| ()));
+			tasks.push(Self::serve_group(session.clone(), msg, priority, group, version, shed.clone(), relay_latency.clone(), group_arrival).map(|_| ()));
 		}
 	}
 
@@ -408,7 +507,10 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 		mut group: GroupConsumer,
 		version: Version,
 		shed: Option<Arc<ShedController>>,
+		relay_latency: Option<Arc<RelayLatencyStats>>,
+		group_arrival: Instant,
 	) -> Result<(), Error> {
+		let serve_start = Instant::now();
 		// TODO add a way to open in priority order.
 		let stream = session.open_uni().await.map_err(Error::from_transport)?;
 
@@ -466,6 +568,12 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 
 		stream.finish()?;
 		stream.closed().await?;
+
+		if let Some(ref latency) = relay_latency {
+			let queue_us = (serve_start - group_arrival).as_micros() as u64;
+			let serve_us = serve_start.elapsed().as_micros() as u64;
+			latency.record(priority_value, queue_us, serve_us);
+		}
 
 		tracing::debug!(sequence = %msg.sequence, "finished group");
 
